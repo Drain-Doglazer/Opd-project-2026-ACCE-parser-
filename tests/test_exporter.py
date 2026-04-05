@@ -1,8 +1,6 @@
-# tests/test_exporter.py
 import sys
 import os
 
-# Добавляем корень проекта в путь, чтобы импорты работали
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from modules.schema import ACCERecord
@@ -44,7 +42,7 @@ def create_mock_data():
     fan.parent_area = "0407.423"
 
     fan.flow_rate = 5000.0
-    fan.pressure = 2500.0  # Па
+    fan.pressure = 2500.0
     fan.pressure_unit = "Па"
     fan.motor_power_kw = 15.0
     records.append(fan)
@@ -66,11 +64,10 @@ def create_mock_data():
     boiler.pressure_unit = "МПа"
     records.append(boiler)
 
-    # 4. Реактор (VT) - из Пример 3.docx (Р-001)
     reactor = ACCERecord()
     reactor.source_file = "Пример 3.docx"
     reactor.raw_tag = "Р-001"
-    reactor.user_tag = "R-001"  # Транслитерация
+    reactor.user_tag = "R-001"
     reactor.description_ru = "Реактор окисления"
     reactor.quantity = 1
     reactor.acce_item_symbol = "VT"
@@ -86,7 +83,6 @@ def create_mock_data():
     reactor.material = "12ХМ"
     records.append(reactor)
 
-    # 5. Невалидная запись (для проверки листа VALIDATION)
     bad_rec = ACCERecord()
     bad_rec.raw_tag = "BAD-TAG"
     bad_rec.user_tag = "BAD-TAG"
@@ -99,29 +95,25 @@ def create_mock_data():
 
 
 if __name__ == "__main__":
-    print("🛠 Generating mock data...")
+    print("Generating mock data...")
     mock_records = create_mock_data()
 
-    # Пути
-    # Шаблон будет создан автоматически функцией _create_dummy_template, если его нет
-    template_file = "tests/dummy_acce_template.xlsx"
-    output_file = "output/test_export_result.xlsx"
+    template_file = "templates/dummy_acce_template.xlsx"
 
-    # Убедимся, что папка output существует
+    output_file = "output/test_export_result_final.xlsx"
+
     os.makedirs("output", exist_ok=True)
-    os.makedirs("tests", exist_ok=True)
 
-    print(f"🚀 Exporting {len([r for r in mock_records if r.is_valid])} valid records...")
+    print(f"Exporting using template: {template_file}")
 
     try:
         result = export_to_acce(
             records=mock_records,
             template_path=template_file,
             output_path=output_file,
-            project_name="Test Project 2026"
+            project_name="Test Project with Static Template"
         )
 
-        print(f"\n✅ SUCCESS!")
         print(f"File saved to: {result.output_path}")
         print(f"Exported: {result.exported_count} items")
         print(f"Skipped: {result.skipped_count} items")
@@ -129,14 +121,11 @@ if __name__ == "__main__":
         if result.warnings:
             print(f"Warnings: {result.warnings}")
 
-        print("\n📋 Next steps:")
-        print("1. Open the file in Excel.")
-        print("2. Check sheets: Contents, AREAS, CP, FN, STB, VT, VALIDATION.")
-        print("3. Verify that 'BAD-TAG' is in VALIDATION sheet with status INVALID.")
-        print("4. Verify that pressures are converted to kPa (e.g., 0.8 MPa -> 800 kPa).")
-
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}")
+        print("Make sure 'dummy_template.xlsx' exists in the project root.")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"Error: {e}")
         import traceback
 
         traceback.print_exc()
