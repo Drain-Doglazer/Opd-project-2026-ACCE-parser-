@@ -1,0 +1,26 @@
+[
+  {
+    "timestamp": "2026-05-20 20:39:13",
+    "filename": "Samples 1.pdf",
+    "total": 28,
+    "valid": 28,
+    "invalid": 0,
+    "warnings": 28,
+    "with_template": true,
+    "exported": 24,
+    "skipped": 0,
+    "unknown": 4
+  },
+  {
+    "timestamp": "2026-05-20 20:33:46",
+    "filename": "Samples 1.pdf",
+    "total": 28,
+    "valid": 28,
+    "invalid": 0,
+    "warnings": 28,
+    "with_template": true,
+    "exported": 24,
+    "skipped": 0,
+    "unknown": 4
+  }
+]

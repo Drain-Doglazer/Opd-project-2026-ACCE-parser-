@@ -1,198 +1,27 @@
-"""
-parser_xlsx.py
-==============
-Парсер Excel-файлов с перечнями оборудования.
+"""parser_xlsx.py — Reads an Excel equipment list and returns raw ACCERecord objects.
 
-
-ЧТО ПАРСИМ (нужно ACCE):
-  - Тэговый номер оборудования → user_tag
-  - Наименование (рус + англ)  → description_ru, description_en
-  - Тех. характеристики        → flow_rate, pressure, volume,
-                                  capacity_kw, diameter_m, length_m,
-                                  dn_mm, lift_capacity_t
-  - Количество                 → quantity
-  - Вес единицы (кг)           → weight_unit_kg   (нужен ACCE для расчёта)
-  - Всего масса (кг / тонны)   → weight_total_kg, weight_total_t
-  - ТИТУЛ (область/зона)       → parent_area
-
-ЧТО НЕ ПАРСИМ:
-  - Код единичной расценки (колонка E) — российская локальная расценка,
-    не используется в Icarus/ACCE. Тип оборудования мы определяем сами
-    по наименованию через keyword-матчинг.
-  - № п/п — порядковый номер строки, не нужен ACCE.
-  - Колонка I (пустая, слитая).
-
-ОПРЕДЕЛЕНИЕ ТИПА ОБОРУДОВАНИЯ (acce_item_symbol):
-  Выполняется по ключевым словам из наименования.
-  Соответствует символам Icarus (CP, FN, GC, VT, HE, FU, STB, CE, HO).
-  Подробнее: Aspen Icarus Reference Guide V15, Chapter 1, pp. 1-3.
+Single responsibility: open the file, extract rows, map cells to ACCERecord fields.
+Classification (acce_item_symbol / acce_item_type) is NOT performed here.
 """
 
 import re
 import openpyxl
-from dataclasses import dataclass, field
 from typing import Optional
 
-
-# ─────────────────────────────────────────────────────────────────
-# СХЕМА ДАННЫХ
-# Содержит только поля, которые нужны ACCE.
-# ─────────────────────────────────────────────────────────────────
-
-@dataclass
-class ACCERecord:
-
-    # --- Трассировка источника ---
-    source_file:  str = ""   # путь к файлу
-    source_sheet: str = ""   # имя листа
-    source_row:   int = 0    # номер строки (для отчёта об ошибках)
-
-    # --- Идентификация (нужна ACCE) ---
-    raw_tag:         str = ""   # тэговый номер из файла
-    user_tag:        str = ""   # очищенный тэг для ACCE (макс. 20 символов)
-    description_ru:  str = ""   # наименование по-русски
-    description_en:  str = ""   # наименование по-английски
-    parent_area:     str = ""   # ТИТУЛ → зона/область в ACCE (AREAS sheet)
-    quantity:        int = 1    # количество единиц
-
-    # --- Вес (нужен ACCE для расчёта установки) ---
-    weight_unit_kg:  Optional[float] = None   # вес одной единицы, кг
-    weight_total_kg: Optional[float] = None   # общий вес, кг
-    weight_total_t:  Optional[float] = None   # общий вес, тонны
-
-    # --- Тех. характеристики (нужны Icarus для расчёта) ---
-    tech_raw:          str   = ""    # оригинальная строка (для аудита)
-    flow_rate:         Optional[float] = None  # Q, м3/ч или т/ч
-    flow_rate_unit:    str   = ""
-    pressure:          Optional[float] = None  # P, МПа или Па
-    pressure_unit:     str   = ""
-    volume:            Optional[float] = None  # V, м3
-    volume_unit:       str   = ""
-    capacity_kw:       Optional[float] = None  # Q когда единица кВт (котлы)
-    diameter_m:        Optional[float] = None  # Φ, м (инсинераторы, сосуды)
-    length_m:          Optional[float] = None  # L, м (второй размер Φ×L)
-    dn_mm:             Optional[int]   = None  # DN, мм (трубопроводная арматура)
-    lift_capacity_t:   Optional[float] = None  # T=, т (краны, тали)
-
-    # --- Классификация Icarus ---
-    # Символ типа из Icarus Reference Guide V15, Chapter 1, pp. 1-3
-    # CP, FN, GC, VT, HE, FU, STB, CE, HO, ...
-    acce_item_symbol: str = ""
-    acce_item_type:   str = ""   # подтип, например CENTRIF, API 610, CYLINDER
-
-    # --- Управляющие поля ACCE (заполняет экспортёр) ---
-    action:     str = "NEW"    # NEW / CHANGE / DELETE / IGNORE
-
-    # --- Результат валидации ---
-    is_valid:   bool = False
-    errors:     list = field(default_factory=list)
-    warnings:   list = field(default_factory=list)
-
-
-# ─────────────────────────────────────────────────────────────────
-# КЛАССИФИКАЦИЯ ОБОРУДОВАНИЯ ПО КЛЮЧЕВЫМ СЛОВАМ
-# Источник: Icarus Reference Guide V15, Chapter 1, Table of Equipment
-# ─────────────────────────────────────────────────────────────────
-
-# Каждая запись: ([ключевые слова], icarus_symbol, icarus_subtype)
-# Проверяются по порядку — первое совпадение побеждает.
-KEYWORD_MAP = [
-    # Насосы (CP / P / GP)
-    (["centrif.*pump", "cp ", "centrifugal pump",
-      "насос.*центробежн", "центробежн.*насос",
-      "circulating.*pump", "water pump", "насос для"],
-     "CP", "CENTRIF"),
-    (["gear pump", "шестерёнч.*насос"],
-     "GP", "GEAR"),
-    (["diaphragm pump", "мембранн.*насос", "мембранный насос"],
-     "P", "DIAPHRAGM"),
-    (["pump", "насос"],
-     "CP", "CENTRIF"),   # общий случай — насос
-
-    # Вентиляторы и нагнетатели (FN)
-    (["fan", "blower", "вентилятор", "нагнетатель",
-      "induced draft", "forced draft", "дутьевой", "дымосос"],
-     "FN", "CENTRIF"),
-
-    # Компрессоры (AC / GC)
-    (["air compressor", "воздушн.*компрессор", "компрессор.*воздух"],
-     "AC", "CENTRIF M"),
-    (["compressor", "компрессор"],
-     "GC", "CENTRIF"),
-
-    # Теплообменники (HE / RB)
-    (["heat exchanger", "теплообменник", "cooler", "охладитель",
-      "condenser", "конденсатор", "air cooler", "воздушн.*охлад"],
-     "HE", "FLOAT HEAD"),
-    (["reboiler", "рибойлер", "кипятильник"],
-     "RB", "THERMOSIPHON"),
-
-    # Печи, огневые нагреватели, инсинераторы (FU)
-    (["incinerator", "инсинератор", "furnace", "печь",
-      "fired heater", "огневой нагрев", "boiler.*fired",
-      "горелка", "burner"],
-     "FU", "HEATER"),
-
-    # Котлы (STB)
-    (["boiler", "котёл", "котел", "htmboiler", "htm boiler",
-      "steam boiler", "паровой котёл"],
-     "STB", "BOILER"),
-
-    # Вертикальные сосуды, ёмкости, резервуары (VT)
-    (["vertical.*tank", "vertical.*vessel", "vertical.*drum",
-      "вертикальн.*ёмкост", "вертикальн.*сосуд",
-      "деаэратор", "deaerator",
-      "softening device", "умягчитель", "умягчен",
-      "tank", "vessel", "drum", "ёмкость", "сосуд",
-      "резервуар", "бак"],
-     "VT", "CYLINDER"),
-
-    # Горизонтальные сосуды (HT)
-    (["horizontal.*tank", "horizontal.*vessel", "horizontal.*drum",
-      "горизонтальн.*сосуд", "горизонтальн.*ёмкост"],
-     "HT", "HORIZ DRUM"),
-
-    # Краны мостовые (CE)
-    (["bridge crane", "overhead crane", "мостовой кран",
-      "кран мостовой", "кран-балка"],
-     "CE", "BRIDGE CRN"),
-
-    # Тали, подъёмники (HO)
-    (["hoist", "electric hoist", "таль", "подъёмник",
-      "электрический подъёмник"],
-     "HO", "HOIST"),
-
-    # Клапаны — статическое оборудование, не рассчитывается Icarus отдельно
-    # Оставляем в VT как «статическое» (ближайший тип)
-    (["valve", "клапан", "задвижка"],
-     "VT", "CYLINDER"),
-]
-
-
-def _classify(description_en: str, description_ru: str) -> tuple[str, str]:
-    """
-    Определяет Icarus item symbol и подтип по наименованию.
-    Возвращает (symbol, subtype) или ("", "") если не определено.
-    """
-    text = (description_en + " " + description_ru).lower()
-    for keywords, symbol, subtype in KEYWORD_MAP:
-        for kw in keywords:
-            if re.search(kw, text, re.IGNORECASE):
-                return symbol, subtype
-    return "", ""
+from .schema import ACCERecord
+from .spec_parser import parse_spec
 
 
 # ─────────────────────────────────────────────────────────────────
 # ПАРСИНГ ТЕХ. ХАРАКТЕРИСТИК
-# Обрабатывает все паттерны, встреченные в реальных файлах:
-#   Q=160m3/h  P=0.8MPa  V=6m3  T=5t H=6m  Φ3.8×25m  DN500
+# Обрабатывает паттерны: Q=160m3/h  P=0.8MPa  V=6m3  Φ3.8×25m  DN500
 # ─────────────────────────────────────────────────────────────────
 
 _UNITS = r'(m3/h|m3|kW|MPa|kPa|Pa|t/h|kg/h|t|m)?'
 
 
 def _extract_param(text: str, key: str) -> tuple[Optional[float], str]:
-    """Извлекает Q=, P=, V= и т.д. Для диапазонов берёт нижнее значение."""
+    """Extracts Q=, P=, V= etc. For ranges takes the lower value."""
     pattern = (
         rf'(?<![A-Za-z]){re.escape(key)}\s*=\s*'
         rf'([0-9][0-9,\.]*)'
@@ -224,16 +53,13 @@ def _extract_phi(text: str) -> tuple[Optional[float], Optional[float]]:
 
 
 def _extract_lift(text: str) -> Optional[float]:
-    """T=5t → 5.0 т (грузоподъёмность крана/тали)"""
+    """T=5t → 5.0 (crane/hoist rated load in tonnes)"""
     m = re.search(r'T\s*=\s*([\d.]+)\s*t', text)
     return float(m.group(1)) if m else None
 
 
 def _parse_tech(raw: str) -> dict:
-    """
-    Разбирает строку тех. характеристик на структурированные поля.
-    Возвращает словарь только с найденными значениями.
-    """
+    """Parses a technical specification string into structured fields."""
     if not raw:
         return {}
     result = {}
@@ -247,9 +73,9 @@ def _parse_tech(raw: str) -> dict:
 
     if q_val is not None:
         if q_unit and q_unit.lower() == 'kw':
-            result['capacity_kw']    = q_val        # котлы: Q в кВт = тепловая мощность
+            result['capacity_kw']    = q_val
         else:
-            result['flow_rate']      = q_val        # насосы/вентиляторы: Q = расход
+            result['flow_rate']      = q_val
             result['flow_rate_unit'] = q_unit
 
     if p_val is not None:
@@ -279,10 +105,7 @@ def _parse_tech(raw: str) -> dict:
 # ─────────────────────────────────────────────────────────────────
 
 def _build_merge_map(sheet) -> dict:
-    """
-    openpyxl возвращает None для объединённых ячеек (кроме левой верхней).
-    Строим словарь (row, col) → значение чтобы ничего не потерять.
-    """
+    """Maps every cell in a merged range to the top-left cell's value."""
     merge_map = {}
     for rng in sheet.merged_cells.ranges:
         val = sheet.cell(row=rng.min_row, column=rng.min_col).value
@@ -327,10 +150,7 @@ def _int(v) -> Optional[int]:
 
 
 def _split_bilingual(text: str) -> tuple[str, str]:
-    """
-    'Насос для воды / Circulating Water Pump' → ('Насос для воды', 'Circulating Water Pump')
-    Если разделителя нет — весь текст в русское поле.
-    """
+    """'Насос / Pump' → ('Насос', 'Pump'). No separator → all goes to RU field."""
     if '/' in text:
         parts = text.split('/', 1)
         return parts[0].strip(), parts[1].strip()
@@ -341,10 +161,7 @@ _FORBIDDEN = re.compile(r'[!@#$%&*()?/{}[\]*=<>,`~^:;|"\' \\+\s～]')
 
 
 def _make_user_tag(raw_tag: str, row_num: int) -> str:
-    """
-    Создаёт валидный ACCE user_tag из сырого тэга.
-    Правила ACCE: макс. 20 символов, без пробелов и спецсимволов.
-    """
+    """Creates a valid ACCE user_tag: max 20 chars, no spaces or special characters."""
     safe = _FORBIDDEN.sub('-', raw_tag.strip())
     safe = re.sub(r'-{2,}', '-', safe).strip('-')
     safe = safe[:20]
@@ -352,103 +169,142 @@ def _make_user_tag(raw_tag: str, row_num: int) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────
-# ИНДЕКСЫ КОЛОНОК (подтверждено по файлу Пример_4.xlsx)
-# ─────────────────────────────────────────────────────────────────
-COL_SEQ   = 1   # № п/п              — НЕ ПАРСИМ (не нужен ACCE)
-COL_AREA  = 2   # ТИТУЛ              → parent_area
-COL_TAG   = 3   # ТЭГОВЫЙ НОМЕР      → raw_tag, user_tag
-COL_DESC  = 4   # НАИМЕНОВАНИЕ       → description_ru, description_en
-COL_CODE  = 5   # КОД ЕД. РАСЦЕНКИ  — НЕ ПАРСИМ (российская расценка)
-COL_TECH  = 6   # ТЕХ. ХАРАКТЕРИСТИКИ → flow_rate, pressure, ...
-COL_QTY   = 7   # КОЛ.               → quantity
-COL_WU    = 8   # ВЕС ЕДИНИЦЫ (кг)  → weight_unit_kg
-# COL 9 — пустая объединённая ячейка, пропускаем
-COL_WT    = 10  # ВСЕГО МАССА, кг   → weight_total_kg
-COL_WTT   = 11  # ВСЕГО МАССА, т    → weight_total_t
-
-HEADER_ROW  = 1   # строка с заголовками
-DATA_START  = 3   # первая строка данных (строка 2 — часть объединённого заголовка)
-DATA_SHEET  = 'Лист1'
-
-
-# ─────────────────────────────────────────────────────────────────
-# ОСНОВНАЯ ФУНКЦИЯ ПАРСЕРА
+# SHEET AND COLUMN DETECTION
 # ─────────────────────────────────────────────────────────────────
 
-def parse_xlsx(filepath: str) -> tuple[list[ACCERecord], list[dict]]:
+_TAG_SIGNALS = ('таговый', 'тэговый', 'тег', 'tag')
+
+_COL_PATTERNS: dict[str, list[str]] = {
+    'area':   ['титул', 'зона', 'area', 'установка'],
+    'tag':    ['таговый', 'тэговый', 'тег', 'tag'],
+    'desc':   ['наименован', 'описание', 'description', 'name'],
+    'tech':   ['характеристик', 'тех.', 'тех ', 'spec', 'technical'],
+    'qty':    ['кол.', 'количеств', 'qty', 'quantity'],
+    'wu':     ['вес единицы', 'масса единицы', 'unit weight', 'unit wt'],
+    'wt':     ['масса, кг', 'масса,кг', 'total kg', 'всего кг'],
+    'wtt':    ['тонн', 'total t'],
+    'motor':  ['мощност', 'power (kw)', 'мощность электро'],
+    'vfd':    ['частот', 'frequency convers'],
+    'expl':   ['взрыв', 'explosion'],
+    'status': ['состояние', 'operation status'],
+}
+
+# Fallbacks for required columns only; optional ones default to -1 (absent).
+_COL_REQUIRED_DEFAULTS: dict[str, int] = {
+    'tag': 3, 'desc': 4, 'tech': 6, 'qty': 7,
+}
+
+
+def _scan_cell(v) -> str:
+    return str(v).lower().strip() if v is not None else ""
+
+
+def _find_sheet(wb):
     """
-    Читает Excel-файл с перечнем оборудования.
-
-    Возвращает:
-        records        — список ACCERecord с данными для ACCE
-        parse_warnings — строки, которые были пропущены и причина
+    Returns (worksheet, header_row_index).
+    Scans all sheets for the first row that contains a tag-column keyword.
+    Falls back to the first sheet, row 1 if nothing matches.
     """
-    wb = openpyxl.load_workbook(filepath, data_only=True)
+    for name in wb.sheetnames:
+        ws = wb[name]
+        for row_idx in range(1, min(6, ws.max_row + 1)):
+            row_text = " ".join(
+                _scan_cell(ws.cell(row=row_idx, column=c).value)
+                for c in range(1, min(ws.max_column + 1, 30))
+            )
+            if any(sig in row_text for sig in _TAG_SIGNALS):
+                return ws, row_idx
+    return wb[wb.sheetnames[0]], 1
 
-    if DATA_SHEET not in wb.sheetnames:
-        raise ValueError(
-            f"Лист '{DATA_SHEET}' не найден. "
-            f"Доступные листы: {wb.sheetnames}"
-        )
 
-    ws = wb[DATA_SHEET]
+def _detect_cols(ws, header_row: int) -> dict[str, int]:
+    """
+    Maps column roles to 1-based column indices by scanning the header row.
+    Required roles fall back to hardcoded defaults; optional roles return -1.
+    """
+    n = min(ws.max_column, 30)
+    headers = [
+        _scan_cell(ws.cell(row=header_row, column=c).value)
+        for c in range(1, n + 1)
+    ]
+    result: dict[str, int] = {}
+    for role, patterns in _COL_PATTERNS.items():
+        for ci, h in enumerate(headers, start=1):
+            if any(p in h for p in patterns):
+                result[role] = ci
+                break
+        else:
+            result[role] = _COL_REQUIRED_DEFAULTS.get(role, -1)
+    return result
+
+
+def _find_data_start(ws, header_row: int) -> int:
+    """
+    Returns the first row that contains actual data after the header.
+    Skips blank rows and sub-header rows (where col 1 is non-numeric).
+    Falls back to header_row + 2.
+    """
+    for row_idx in range(header_row + 1, min(header_row + 5, ws.max_row + 1)):
+        v = ws.cell(row=row_idx, column=1).value
+        if v is None:
+            continue
+        try:
+            int(float(str(v).strip()))
+            return row_idx
+        except (ValueError, TypeError):
+            continue
+    return header_row + 2
+
+
+# ─────────────────────────────────────────────────────────────────
+# PUBLIC API
+# ─────────────────────────────────────────────────────────────────
+
+def parse(file_path: str) -> list[ACCERecord]:
+    """Reads an Excel equipment list and returns a list of ACCERecord objects."""
+    import os
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    ws, header_row = _find_sheet(wb)
+    cols = _detect_cols(ws, header_row)
+    data_start = _find_data_start(ws, header_row)
     mm = _build_merge_map(ws)
-    records:        list[ACCERecord] = []
-    parse_warnings: list[dict]       = []
+    records: list[ACCERecord] = []
 
-    for row_idx in range(DATA_START, ws.max_row + 1):
-
-        # Пропускаем полностью пустые строки
+    for row_idx in range(data_start, ws.max_row + 1):
         vals = [_cell(ws, row_idx, c, mm) for c in range(1, 12)]
         if all(v is None for v in vals):
             continue
 
-        # Читаем только нужные ACCE поля
-        area      = _str(_cell(ws, row_idx, COL_AREA, mm))
-        tag       = _str(_cell(ws, row_idx, COL_TAG,  mm))
-        desc_raw  = _str(_cell(ws, row_idx, COL_DESC, mm))
-        # COL_CODE — код расценки — намеренно не читаем
-        tech_raw  = _str(_cell(ws, row_idx, COL_TECH, mm))
-        qty       = _int(_cell(ws, row_idx, COL_QTY,  mm))
-        w_unit    = _float(_cell(ws, row_idx, COL_WU,  mm))
-        w_total   = _float(_cell(ws, row_idx, COL_WT,  mm))
-        w_total_t = _float(_cell(ws, row_idx, COL_WTT, mm))
+        area      = _str(_cell(ws, row_idx, cols['area'], mm)) if cols['area'] > 0 else ""
+        tag       = _str(_cell(ws, row_idx, cols['tag'],  mm))
+        desc_raw  = _str(_cell(ws, row_idx, cols['desc'], mm))
+        tech_raw  = _str(_cell(ws, row_idx, cols['tech'], mm))
+        qty       = _int(_cell(ws, row_idx, cols['qty'],  mm))
+        w_unit    = _float(_cell(ws, row_idx, cols['wu'],  mm)) if cols['wu']  > 0 else None
+        w_total   = _float(_cell(ws, row_idx, cols['wt'],  mm)) if cols['wt']  > 0 else None
+        w_total_t = _float(_cell(ws, row_idx, cols['wtt'], mm)) if cols['wtt'] > 0 else None
 
-        # Пропускаем итоговые/суммарные строки (нет тэга и нет порядкового номера)
-        seq = _int(_cell(ws, row_idx, COL_SEQ, mm))
+        seq = _int(_cell(ws, row_idx, 1, mm))
         if not tag and not seq:
-            parse_warnings.append({
-                "sheet": DATA_SHEET, "row": row_idx,
-                "reason": "Нет тэга и порядкового номера — "
-                          "вероятно итоговая строка, пропущена"
-            })
+            continue
+        if not tag and not desc_raw:
             continue
 
-        # Предупреждение если нет тэга
         row_warns = []
         if not tag:
-            row_warns.append("Отсутствует тэговый номер оборудования")
+            row_warns.append("Missing equipment tag")
         if not desc_raw:
-            row_warns.append("Отсутствует наименование")
+            row_warns.append("Missing equipment name")
 
-        # Разбиваем двуязычное наименование
         desc_ru, desc_en = _split_bilingual(desc_raw)
-
-        # Определяем тип оборудования по наименованию (не по коду расценки)
-        symbol, subtype = _classify(desc_en, desc_ru)
-        if not symbol:
-            row_warns.append(
-                f"Не удалось определить тип Icarus по наименованию: "
-                f"'{desc_en or desc_ru}'"
-            )
-
-        # Разбираем тех. характеристики
         tech = _parse_tech(tech_raw)
 
-        # Строим запись
         record = ACCERecord(
-            source_file  = filepath,
-            source_sheet = DATA_SHEET,
+            source_file  = file_path,
+            source_sheet = ws.title,
             source_row   = row_idx,
 
             raw_tag         = tag,
@@ -462,34 +318,58 @@ def parse_xlsx(filepath: str) -> tuple[list[ACCERecord], list[dict]]:
             weight_total_kg = w_total,
             weight_total_t  = w_total_t,
 
-            tech_raw          = tech_raw,
-            flow_rate         = tech.get('flow_rate'),
-            flow_rate_unit    = tech.get('flow_rate_unit', ''),
-            pressure          = tech.get('pressure'),
-            pressure_unit     = tech.get('pressure_unit', ''),
-            volume            = tech.get('volume'),
-            volume_unit       = tech.get('volume_unit', ''),
-            capacity_kw       = tech.get('capacity_kw'),
-            diameter_m        = tech.get('diameter_m'),
-            length_m          = tech.get('length_m'),
-            dn_mm             = tech.get('dn_mm'),
-            lift_capacity_t   = tech.get('lift_capacity_t'),
+            tech_raw        = tech_raw,
+            flow_rate       = tech.get('flow_rate'),
+            flow_rate_unit  = tech.get('flow_rate_unit', ''),
+            pressure        = tech.get('pressure'),
+            pressure_unit   = tech.get('pressure_unit', ''),
+            volume          = tech.get('volume'),
+            volume_unit     = tech.get('volume_unit', ''),
+            capacity_kw     = tech.get('capacity_kw'),
+            diameter_m      = tech.get('diameter_m'),
+            length_m        = tech.get('length_m'),
+            dn_mm           = tech.get('dn_mm'),
+            lift_capacity_t = tech.get('lift_capacity_t'),
 
-            acce_item_symbol = symbol,
-            acce_item_type   = subtype,
-
-            action    = "NEW",
-            is_valid  = len(row_warns) == 0,
-            warnings  = row_warns,
+            action   = "NEW",
+            is_valid = len(row_warns) == 0,
+            warnings = row_warns,
         )
+
+        # Apply spec_parser results to any fields not yet populated
+        for f, v in parse_spec(tech_raw).items():
+            if hasattr(record, f) and getattr(record, f) is None:
+                setattr(record, f, v)
+
+        # Motor power kW
+        motor_col = cols.get('motor', -1)
+        if motor_col > 0:
+            pwr_raw = str(_cell(ws, row_idx, motor_col, mm) or '')
+            m = re.search(r'([\d.]+)', pwr_raw)
+            if m and record.motor_power_kw is None:
+                record.motor_power_kw = float(m.group(1))
+
+        # VFD
+        vfd_col = cols.get('vfd', -1)
+        if vfd_col > 0:
+            val = str(_cell(ws, row_idx, vfd_col, mm) or '').upper()
+            record.vfd = 'ДА' in val or 'YES' in val
+
+        # Explosion proof
+        expl_col = cols.get('expl', -1)
+        if expl_col > 0:
+            val = str(_cell(ws, row_idx, expl_col, mm) or '').upper()
+            record.explosion_proof = 'ДА' in val or 'YES' in val
+
+        # Operation status
+        status_col = cols.get('status', -1)
+        if status_col > 0:
+            val = str(_cell(ws, row_idx, status_col, mm) or '').upper()
+            if 'РЕЗЕРВ' in val or 'STANDBY' in val or 'SPAR' in val:
+                record.operation_status = 'SPAR'
+            else:
+                record.operation_status = 'DUTY'
 
         records.append(record)
 
-        if row_warns:
-            parse_warnings.append({
-                "sheet": DATA_SHEET, "row": row_idx,
-                "tag": tag,
-                "reason": "; ".join(row_warns)
-            })
-
-    return records, parse_warnings
+    return records

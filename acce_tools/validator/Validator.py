@@ -90,7 +90,7 @@ ICARUS_LIMITS = {
     "FN": {
         "CENTRIF": {
             "flow_rate_m3h": (1200, 1_529_000),  # м3/ч
-            "pressure_kpa":  (0,    3.7),         # Па → кПа
+            "pressure_kpa":  (0,    None),        # Па → кПа (нет верхнего лимита — зависит от типа)
         },
         "VANEAXIAL": {
             "flow_rate_m3h": (3950, 76_450),
@@ -244,14 +244,32 @@ def _check_completeness(record, seen_tags: set) -> bool:
     else:
         seen_tags.add(record.user_tag)
 
-    # A6: зона указана
+    # A6: зона не указана — предупреждение, экспортёр подставит default_area
     if not record.parent_area or not record.parent_area.strip():
-        errors.append("[A6] parent_area не указана")
+        record.warnings.append("[A6] parent_area не указана")
 
     # A7: тип Icarus определён
     if not record.acce_item_symbol:
         errors.append("[A7] acce_item_symbol не определён — запись не экспортируется")
         return False   # ранний выход — дальше некорректно проверять
+
+    # A8–A13: тип-специфические поля — предупреждения, не ошибки
+    sym = record.acce_item_symbol
+    if sym == 'CP' and record.flow_rate is None:
+        record.warnings.append("[A8] CP: flow_rate не указан")
+    if sym in ('CP', 'GC', 'FN') and record.motor_power_kw is None:
+        record.warnings.append(f"[A9] {sym}: motor_power_kw не указан")
+    if sym in ('GC', 'FU', 'STB') and record.capacity_kw is None:
+        record.warnings.append(f"[A10] {sym}: capacity_kw не указан")
+    if sym == 'HE' and record.heat_transfer_area_m2 is None:
+        record.warnings.append("[A11] HE: heat_transfer_area_m2 не указана")
+    if sym in ('VT', 'TW') and all(
+        v is None for v in [record.diameter_m, record.length_m, record.volume]
+    ):
+        record.warnings.append(f"[A12] {sym}: diameter_m/length_m/volume не указаны")
+    if (sym == 'CE' and record.acce_item_type == 'CRANE'
+            and record.lift_capacity_t is None):
+        record.warnings.append("[A13] CE CRANE: lift_capacity_t не указана")
 
     return True
 
@@ -323,13 +341,12 @@ def _check_ranges(record) -> None:
                  getattr(record, 'length_m', None),
                  limits, errs, code)
 
-    # Проверяем обязательные поля для конкретных типов
+    # Рекомендуемые поля — отсутствие является предупреждением, не ошибкой
     required = REQUIRED_FIELDS.get(sym, [])
     for field in required:
         val = getattr(record, field, None)
         if val is None:
-            errs.append(f"[{code}] Поле '{field}' обязательно для {sym} "
-                        f"но не заполнено")
+            record.warnings.append(f"[W-{sym}] Поле '{field}' не заполнено для {sym}")
 
     # Для вентиляторов: давление в Па нужно конвертировать отдельно
     # (парсер xlsx хранит его в Pa, не в MPa)
@@ -387,9 +404,9 @@ def _check_logic(record) -> None:
                 f"(расхождение {delta*100:.0f}%, допуск ±10%)"
             )
 
-    # C4: котёл без тепловой мощности
+    # C4: котёл без тепловой мощности — предупреждение
     if record.acce_item_symbol == "STB" and record.capacity_kw is None:
-        errs.append("[C4] STB: поле capacity_kw обязательно для котла")
+        warns.append("[W4] STB: capacity_kw не заполнено — ACCE использует значение по умолчанию")
 
     # C5: нет описания
     if not record.description_ru and not record.description_en:

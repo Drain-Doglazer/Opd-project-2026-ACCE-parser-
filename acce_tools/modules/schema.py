@@ -1,46 +1,63 @@
+"""schema.py — Canonical ACCERecord dataclass shared across all parser modules."""
+
 from dataclasses import dataclass, field
 from typing import Optional
+
 
 @dataclass
 class ACCERecord:
     # ── Source tracing ────────────────────────────────────────────────────────
-    source_file:  str = ""   # path to the original xlsx
-    source_sheet: str = ""   # sheet name
-    source_row:   int = 0    # row number in the sheet (for error messages)
+    source_file:  str = ""
+    source_sheet: str = ""
+    source_row:   int = 0
 
-    # ── Identity fields (from the equipment list) ─────────────────────────────
-    seq_number:       int    = 0    # № п/п
-    raw_tag:          str    = ""   # ТАГОВЫЙ НОМЕР ОБОРУДОВАНИЯ (original)
-    description_ru:   str    = ""   # НАИМЕНОВАНИЕ ОБОРУДОВАНИЯ (Russian)
-    description_en:   str    = ""   # English part extracted from bilingual cell
-    price_code:       str    = ""   # код ед.расценки  e.g. "6831", "6880.12"
-    quantity:         int    = 1    # КОЛ.
-    weight_unit_kg:   Optional[float] = None   # ВЕС ЕДИНИЦЫ (кг)
-    weight_total_kg:  Optional[float] = None   # Всего масса, кг
-    weight_total_t:   Optional[float] = None   # Всего масса, ТОННЫ
-    title:            str    = ""   # ТИТУЛ (area / contract section)
+    # ── Identity ─────────────────────────────────────────────────────────────
+    raw_tag:        str = ""
+    user_tag:       str = ""
+    description_ru: str = ""
+    description_en: str = ""
+    parent_area:    str = ""
+    quantity:       int = 1
+    material:       str = ""
 
-    # ── Technical characteristics (parsed from ТЕХ. ХАРАКТЕРИСТИКИ) ──────────
-    tech_raw:         str    = ""           # full original string, kept for audit
-    flow_rate:        Optional[float] = None  # Q value
-    flow_rate_unit:   str    = ""
-    pressure:         Optional[float] = None  # P value
-    pressure_unit:    str    = ""
-    volume:           Optional[float] = None  # V value
-    volume_unit:      str    = ""
-    capacity_kw:      Optional[float] = None  # Q when unit is kW (thermal duty)
-    diameter_m:       Optional[float] = None  # Φ dimension or DN
-    length_m:         Optional[float] = None  # second dimension in Φ×L
-    dn_mm:            Optional[int]   = None  # DN nominal diameter
-    lift_capacity_t:  Optional[float] = None  # T= for hoists/cranes
+    # ── Weight ───────────────────────────────────────────────────────────────
+    weight_unit_kg:  Optional[float] = None
+    weight_total_kg: Optional[float] = None
+    weight_total_t:  Optional[float] = None
 
-    # ── ACCE import control fields (filled by Module 3 — Standardiser) ────────
-    action:           str    = "NEW"
-    user_tag:         str    = ""   # generated unique tag for ACCE
-    parent_area:      str    = ""   # mapped from title
-    acce_equip_type:  str    = ""   # mapped from price_code to ACCE model code
+    # ── Technical characteristics ─────────────────────────────────────────────
+    tech_raw:              str            = ""
+    flow_rate:             Optional[float] = None
+    flow_rate_unit:        str            = ""
+    pressure:              Optional[float] = None
+    pressure_unit:         str            = ""
+    volume:                Optional[float] = None
+    volume_unit:           str            = ""
+    capacity_kw:           Optional[float] = None
+    motor_power_kw:        Optional[float] = None
+    diameter_m:            Optional[float] = None
+    length_m:              Optional[float] = None
+    dn_mm:                 Optional[int]   = None
+    lift_capacity_t:       Optional[float] = None
+    design_temperature:    Optional[float] = None
+    operating_temperature: Optional[float] = None
+    heat_transfer_area_m2: Optional[float] = None
+    heat_duty_gcalh:       Optional[float] = None
 
-    # ── Validation state (filled by Module 2 — Validator) ────────────────────
-    is_valid:         bool   = False
-    errors:           list   = field(default_factory=list)
-    warnings:         list   = field(default_factory=list)
+    # ── Equipment flags ───────────────────────────────────────────────────────
+    vfd:              bool = False
+    explosion_proof:  bool = False
+    operation_status: str  = "DUTY"
+
+    # ── Classification (NOT filled by parsers — belongs to a classifier step) ─
+    acce_item_symbol:      str = ""
+    acce_item_type:        str = ""
+    classification_source: str = ""  # e.g. "tech:flow_rate+pressure", "kw:ru:насос", "prefix:Н-"
+
+    # ── ACCE import control ───────────────────────────────────────────────────
+    action: str = "NEW"
+
+    # ── Validation state ──────────────────────────────────────────────────────
+    is_valid: bool = False
+    errors:   list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
