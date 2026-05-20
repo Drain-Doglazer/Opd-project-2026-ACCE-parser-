@@ -2,6 +2,9 @@
 requires = ["setuptools>=68"]
 build-backend = "setuptools.backends.legacy:build"
 
+[tool.poetry]
+package-mode = false
+
 [project]
 name = "acce-parser"
 version = "0.1.0"
@@ -10,6 +13,8 @@ dependencies = [
     "openpyxl>=3.1",
     "python-docx>=1.1",
     "pdfplumber>=0.10",
+    "pandas>=2.0",
+    "streamlit>=1.35",
 ]
 
 [project.optional-dependencies]
